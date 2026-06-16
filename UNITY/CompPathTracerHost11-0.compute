@@ -1,0 +1,472 @@
+#pragma kernel CSMain
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float wavelength;
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;    
+};
+
+RWTexture2D<float4> Result;              
+RWTexture2D<float4> AccumulationBuffer;
+
+Texture2D<float4> BackgroundSource;
+Texture2D<float> _CameraDepthTexture;    
+float4 _ZBufferParams;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float _Time;
+int _SampleIndex;
+
+float3 _LaserOrigin;
+float3 _LaserDir;
+float _LaserWavelength;
+float _LaserRadius;
+float _PlaneY; 
+
+// --- Configurable Light Uniforms ---
+int _LightMode; // 0 = Monochromatic Laser, 1 = Polychromatic Spectrum Matrix
+float3 _LightCenter;
+float _LightRadius;
+float _LightWavelength;
+float _LightIntensity;
+float4 _LightColor;
+
+float3 _PrismPosition;
+float _PrismSideLength;
+float _PrismLength;
+float4x4 _PrismWorldToLocal;
+float4x4 _PrismLocalToWorld;
+
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RandomInUnitSphere(inout uint state) {
+    while (true) {
+        float3 p = float3(
+            NextRandom(state) * 2.0f - 1.0f,
+            NextRandom(state) * 2.0f - 1.0f,
+            NextRandom(state) * 2.0f - 1.0f
+        );
+        if (dot(p, p) < 1.0f) return p;
+    }
+    return float3(0,0,0);
+}
+
+float EvaluateSpectralReflectance(int matID, float wavelength, float3 hitPosition) {
+    if (matID == 1) return 0.98f;
+    if (matID == 2) { 
+        float scale = 1.0f;
+        float lineWidth = 0.04f; 
+        float2 gridLoc = abs(frac(hitPosition.xz / scale - 0.5f) - 0.5f) / lineWidth;
+        float lineFactor = min(gridLoc.x, gridLoc.y);
+        return lerp(0.40f, 0.95f, 1.0f - min(lineFactor, 1.0f));
+    }
+    return 0.0f;
+}
+
+// =========================================================================
+// UNIFIED EMISSION ARCHITECTURE
+// Handles both localized single-band laser lights and complex wide RGB uplift mixtures
+// =========================================================================
+float EvaluateEmission(int matID, float wavelength) {
+    if (matID == 3) {
+        if (_LightMode == 0) {
+            // Monochromatic Mode
+            float bandwidth = 15.0f; 
+            float delta = (wavelength - _LightWavelength) / bandwidth;
+            return _LightIntensity * exp(-0.5f * delta * delta);
+        }
+        else {
+            // Polychromatic Mode: Broad Gaussian response curves for the color picker input
+            float rCurve = exp(-0.5f * pow((wavelength - 620.0f) / 45.0f, 2.0f));
+            float gCurve = exp(-0.5f * pow((wavelength - 535.0f) / 40.0f, 2.0f));
+            float bCurve = exp(-0.5f * pow((wavelength - 460.0f) / 35.0f, 2.0f));
+            
+            float spectralRadiance = (_LightColor.r * rCurve) + 
+                                     (_LightColor.g * gCurve) + 
+                                     (_LightColor.b * bCurve);
+                                     
+            return spectralRadiance * _LightIntensity;
+        }
+    }
+    return 0.0f;
+}
+
+float EvaluateSkyEmission(float wavelength, float3 rayDir) {
+    return 0.0f;
+}
+
+float3 WavelengthToXYZ(float wave) {
+    float x1 = 1.065f * exp(-0.5f * ((wave - 595.8f) / 33.4f) * ((wave - 595.8f) / 33.4f));
+    float x2 = 0.366f * exp(-0.5f * ((wave - 446.8f) / 18.2f) * ((wave - 446.8f) / 18.2f));
+    float x = x1 + x2;
+    float y = 1.014f * exp(-0.5f * ((wave - 556.4f) / 40.4f) * ((wave - 556.4f) / 40.4f));
+    float z = 1.839f * exp(-0.5f * ((wave - 446.8f) / 22.7f) * ((wave - 446.8f) / 22.7f));
+    return float3(x, y, z);
+}
+
+float3 XYZToRGB(float3 xyz) {
+    float r =  2.975424f * xyz.x - 1.402930f * xyz.y - 0.453346f * xyz.z;
+    float g = -0.923164f * xyz.x + 1.832263f * xyz.y + 0.035174f * xyz.z;
+    float b =  0.053158f * xyz.x - 1.936616f * xyz.y + 1.050730f * xyz.z;
+    return float3(r, g, b);
+}
+
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0f) return;
+    float t = -b - sqrt(discriminant);
+    if (t <= 0.001f) t = -b + sqrt(discriminant);
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.materialID = matID;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal;
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+void IntersectRotatedPrismZ(Ray ray, inout HitRecord bestHit, int matID) {
+    float3 localOrigin = mul(_PrismWorldToLocal, float4(ray.origin, 1.0f)).xyz;
+    float3 localDirection = normalize(mul(_PrismWorldToLocal, float4(ray.direction, 0.0f)).xyz);
+
+    float3 baseNormals[3] = {
+        float3(0.0f, -1.0f, 0.0f),
+        float3(0.866025f, 0.5f, 0.0f),
+        float3(-0.866025f, 0.5f, 0.0f)
+    };
+    
+    float inRadius = _PrismSideLength / (2.0f * 1.7320508f);
+    float3 planePoints[3] = {
+        baseNormals[0] * inRadius,
+        baseNormals[1] * inRadius,
+        baseNormals[2] * inRadius
+    };
+    
+    float tNear = 0.001f;
+    float tFar = 1e20f;
+    float3 hitNormalNearLocal = float3(0, 1, 0);
+
+    for (int i = 0; i < 3; i++) {
+        float denom = dot(baseNormals[i], localDirection);
+        float dist = dot(planePoints[i] - localOrigin, baseNormals[i]);
+        if (abs(denom) > 1e-6f) {
+            float t = dist / denom;
+            if (denom < 0.0f) {
+                if (t > tNear) { 
+                    tNear = t;
+                    hitNormalNearLocal = baseNormals[i]; 
+                }
+            } else {
+                if (t < tFar) tFar = t;
+            }
+        } else if (dist > 0.0f) return;
+    }
+
+    float zMin = -(_PrismLength * 0.5f);
+    float zMax = _PrismLength * 0.5f;
+    float tCapMin = (zMin - localOrigin.z) / (localDirection.z + 1e-8f);
+    float tCapMax = (zMax - localOrigin.z) / (localDirection.z + 1e-8f);
+    float tBot = min(tCapMin, tCapMax);
+    float tTop = max(tCapMin, tCapMax);
+    float3 capNormalLocal = (tCapMin < tCapMax) ? float3(0, 0, -1) : float3(0, 0, 1);
+
+    if (tBot > tNear) { 
+        tNear = tBot; 
+        hitNormalNearLocal = capNormalLocal;
+    }
+    if (tTop < tFar) tFar = tTop;
+    if (tNear > tFar || tFar < 0.001f) return;
+
+    if (tNear > 0.001f && tNear < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = tNear;
+        bestHit.position = ray.origin + tNear * ray.direction;
+        bestHit.normal = normalize(mul(_PrismLocalToWorld, float4(hitNormalNearLocal, 0.0f)).xyz);
+        bestHit.materialID = matID;
+    }
+}
+
+float DistanceRayToSegment(Ray ray, float3 p0, float3 p1) {
+    float3 u = ray.direction;
+    float3 v = p1 - p0;
+    float3 w = ray.origin - p0;
+    float a = dot(u, u);
+    float b = dot(u, v); float c = dot(v, v); float d = dot(u, w); float e = dot(v, w);
+    float denom = a * c - b * b;
+    float sc, tc;
+    if (denom < 1e-6f) { sc = 0.0f; tc = (b > c ? d / b : e / c); } 
+    else { sc = (b * e - c * d) / denom; tc = (a * e - b * d) / denom; }
+    tc = clamp(tc, 0.0f, 1.0f);
+    if (sc < 0.0f) return 1e20f;
+    return distance(ray.origin + sc * u, p0 + tc * v);
+}
+
+float EvaluateAnalyticalWireframe(Ray initialRay) {
+    float inRadius = _PrismSideLength / (2.0f * 1.7320508f);
+    float outRadius = inRadius * 2.0f;
+    float zHalf = _PrismLength * 0.5f;
+    float xHalf = _PrismSideLength * 0.5f;
+    
+    float3 baseV[6];
+    baseV[0] = float3(0.0f,   outRadius, -zHalf);
+    baseV[1] = float3(xHalf,  -inRadius, -zHalf);
+    baseV[2] = float3(-xHalf, -inRadius, -zHalf);
+    baseV[3] = float3(0.0f,   outRadius, zHalf);
+    baseV[4] = float3(xHalf,  -inRadius, zHalf);
+    baseV[5] = float3(-xHalf, -inRadius, zHalf);
+    
+    float3 v[6];
+    [unroll]
+    for(int k = 0; k < 6; k++) {
+        v[k] = mul(_PrismLocalToWorld, float4(baseV[k], 1.0f)).xyz;
+    }
+
+    float minDistance = 1e20f;
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[0], v[1]));
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[1], v[2]));
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[2], v[0]));
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[3], v[4]));
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[4], v[5]));
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[5], v[3]));
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[0], v[3]));
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[1], v[4]));
+    minDistance = min(minDistance, DistanceRayToSegment(initialRay, v[2], v[5]));
+
+    float lineWidth = 0.008f;
+    float smoothEdge = 0.003f;
+    return 1.0f - smoothstep(lineWidth, lineWidth + smoothEdge, minDistance);
+}
+
+void IntersectLaserSegment(Ray camRay, float3 p0, float3 p1, float radius, inout float bestT, inout bool hitLaser) {
+    float3 u = camRay.direction;
+    float3 v = p1 - p0;
+    float3 w = camRay.origin - p0;
+    float a = dot(u, u);
+    float b = dot(u, v); float c = dot(v, v); float d = dot(u, w); float e = dot(v, w);
+    float denom = a * c - b * b;
+    float sc, tc;
+    if (denom < 1e-6f) { sc = 0.0f; tc = (b > c ? d / b : e / c); } 
+    else { sc = (b * e - c * d) / denom; tc = (a * e - b * d) / denom; }
+    tc = clamp(tc, 0.0f, 1.0f);
+    if (sc > 0.001f && sc < bestT) {
+        float3 closestOnCamRay = camRay.origin + sc * u;
+        float3 closestOnSegment = p0 + tc * v;
+        if (distance(closestOnCamRay, closestOnSegment) < radius) {
+            bestT = sc;
+            hitLaser = true;
+        }
+    }
+}
+
+float LinearEyeDepth(float z) {
+    return 1.0f / (_ZBufferParams.x * z + _ZBufferParams.y);
+}
+
+#define SAMPLES_PER_FRAME 80  
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    float3 accumulatedFrameRGB = float3(0, 0, 0);
+
+    float3 laserOrigin = _LaserOrigin;
+    float3 laserDir = _LaserDir; 
+    float laserWavelength = _LaserWavelength;
+    float3 laserPoints[4]; 
+    laserPoints[0] = laserOrigin;
+    int actualSegments = 0;
+
+    Ray currentLaserRay;
+    currentLaserRay.origin = laserOrigin;
+    currentLaserRay.direction = laserDir;
+    currentLaserRay.wavelength = laserWavelength;
+
+    for (int seg = 0; seg < 3; seg++) {
+        HitRecord laserHit;
+        laserHit.didIntersect = false; laserHit.t = 1e20f;
+        IntersectRotatedPrismZ(currentLaserRay, laserHit, 1);
+        IntersectPlane(currentLaserRay, laserHit, float3(0.0f, _PlaneY, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+        IntersectSphere(currentLaserRay, laserHit, _LightCenter, _LightRadius, 3);
+        if (laserHit.didIntersect) {
+            laserPoints[seg + 1] = laserHit.position;
+            actualSegments++;
+            if (laserHit.materialID == 1) { 
+                float baseIOR = 1.52f;
+                float dispersionStrength = 0.12f; 
+                float ior = baseIOR + dispersionStrength * ((650.0f - laserWavelength) / 300.0f);
+                float cosTheta = dot(currentLaserRay.direction, laserHit.normal);
+                float3 outwardNormal = (cosTheta > 0.0f) ? -laserHit.normal : laserHit.normal;
+                float eta = (cosTheta > 0.0f) ? ior : 1.0f / ior;
+                if ((1.0f - eta * eta * (1.0f - cosTheta * cosTheta)) < 0.0f) {
+                    currentLaserRay.direction = normalize(reflect(currentLaserRay.direction, laserHit.normal));
+                    currentLaserRay.origin = laserHit.position + laserHit.normal * 0.001f;
+                } else {
+                    currentLaserRay.direction = normalize(refract(currentLaserRay.direction, outwardNormal, eta));
+                    currentLaserRay.origin = laserHit.position - outwardNormal * 0.001f; 
+                }
+            } else if (laserHit.materialID == 2) { 
+                currentLaserRay.direction = normalize(reflect(currentLaserRay.direction, laserHit.normal));
+                currentLaserRay.origin = laserHit.position + laserHit.normal * 0.001f;
+            } else break;
+        } else {
+            laserPoints[seg + 1] = currentLaserRay.origin + currentLaserRay.direction * 30.0f;
+            actualSegments++;
+            break; 
+        }
+    }
+
+    float2 baseUV = float2(id.xy) / float2(width, height) * 2.0f - 1.0f;
+    float4 baseClipPos = float4(baseUV.x, baseUV.y, 0.0f, 1.0f);
+    float4 baseViewDir = mul(_CameraInverseProjection, baseClipPos); baseViewDir /= baseViewDir.w;
+    float4 baseWorldDir = mul(_CameraToWorld, float4(baseViewDir.xyz, 0.0f));
+    
+    Ray primaryRayReference;
+    primaryRayReference.origin = _CameraToWorld._m03_m13_m23;
+    primaryRayReference.direction = normalize(baseWorldDir.xyz);
+    primaryRayReference.wavelength = 550.0f;
+
+    HitRecord trackingHit;
+    trackingHit.didIntersect = false; trackingHit.t = 1e20f;
+    IntersectRotatedPrismZ(primaryRayReference, trackingHit, 1);
+    IntersectPlane(primaryRayReference, trackingHit, float3(0.0f, _PlaneY, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+    IntersectSphere(primaryRayReference, trackingHit, _LightCenter, _LightRadius, 3);
+    float pathTracerDistance = trackingHit.t;
+    
+    float laserCamT = 1e20f;
+    bool hitLaserBeam = false;
+    for (int s = 0; s < actualSegments; s++) {
+        IntersectLaserSegment(primaryRayReference, laserPoints[s], laserPoints[s+1], _LaserRadius, laserCamT, hitLaserBeam);
+    }
+
+    for (int smpl = 0; smpl < SAMPLES_PER_FRAME; smpl++) {
+        float2 uv = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height) * 2.0f - 1.0f;
+        float4 clipPos = float4(uv.x, uv.y, 0.0f, 1.0f);
+        float4 viewDir = mul(_CameraInverseProjection, clipPos); viewDir /= viewDir.w;
+        float4 worldDir = mul(_CameraToWorld, float4(viewDir.xyz, 0.0f));
+
+        float sampledWavelength = 380.0f + NextRandom(rngState) * 400.0f;
+        
+        Ray ray;
+        ray.origin = _CameraToWorld._m03_m13_m23;
+        ray.direction = normalize(worldDir.xyz);
+        ray.wavelength = sampledWavelength;
+
+        float throughput = 1.0f;
+        float finalSpectralRadiance = 0.0f;
+        
+        for (int i = 0; i < 4; i++) {
+            HitRecord hit;
+            hit.didIntersect = false; hit.t = 1e20f;
+            IntersectRotatedPrismZ(ray, hit, 1);
+            IntersectPlane(ray, hit, float3(0.0f, _PlaneY, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+            IntersectSphere(ray, hit, _LightCenter, _LightRadius, 3);
+            
+            if (hit.didIntersect) {
+                if (hit.materialID == 3) {
+                    finalSpectralRadiance += EvaluateEmission(hit.materialID, ray.wavelength) * throughput;
+                    break; 
+                }
+                if (hit.materialID == 1) {
+                    float ior = 1.52f + 0.12f * ((650.0f - ray.wavelength) / 300.0f);
+                    float cosTheta = dot(ray.direction, hit.normal);
+                    float3 outwardNormal = (cosTheta > 0.0f) ? -hit.normal : hit.normal;
+                    float eta = (cosTheta > 0.0f) ? ior : 1.0f / ior;
+                    if (cosTheta < 0.0f) cosTheta = -cosTheta;
+                    float r0 = pow((1.0f - ior) / (1.0f + ior), 2.0f);
+                    float fresnel = r0 + (1.0f - r0) * pow(1.0f - cosTheta, 5.0f);
+                    if ((1.0f - eta * eta * (1.0f - cosTheta * cosTheta)) < 0.0f || NextRandom(rngState) < fresnel) {
+                        ray.direction = normalize(reflect(ray.direction, hit.normal));
+                        ray.origin = hit.position + hit.normal * 0.001f;
+                    } else {
+                        ray.direction = normalize(refract(ray.direction, outwardNormal, eta));
+                        ray.origin = hit.position - outwardNormal * 0.001f; 
+                    }
+                    throughput *= EvaluateSpectralReflectance(hit.materialID, ray.wavelength, hit.position);
+                }
+                else if (hit.materialID == 2) {
+                    ray.origin = hit.position + hit.normal * 0.001f;
+                    ray.direction = normalize(hit.normal + RandomInUnitSphere(rngState));
+                    throughput *= EvaluateSpectralReflectance(hit.materialID, ray.wavelength, hit.position);
+                    throughput *= max(dot(hit.normal, ray.direction), 0.0f) * 2.0f;
+                }
+                if (throughput < 0.05f) {
+                    if (NextRandom(rngState) > 0.2f) break;
+                    throughput /= 0.2f;
+                }
+            } else {
+                finalSpectralRadiance += EvaluateSkyEmission(ray.wavelength, ray.direction) * throughput;
+                break;
+            }
+        }
+        float3 xyzWeight = WavelengthToXYZ(ray.wavelength);
+        float3 frameXYZ = xyzWeight * finalSpectralRadiance * (400.0f * 0.00535f);
+        accumulatedFrameRGB += max(XYZToRGB(frameXYZ), 0.0f);
+    }
+
+    float3 frameRGB = accumulatedFrameRGB / (float)SAMPLES_PER_FRAME;
+    float blendFactor = 1.0f / (float)_SampleIndex;
+    float3 historicalRGB = AccumulationBuffer[id.xy].xyz;
+    float3 accumulatedRGB = lerp(historicalRGB, frameRGB, blendFactor);
+    AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+    
+    float edgeWeight = EvaluateAnalyticalWireframe(primaryRayReference);
+    float3 finalRGB = lerp(accumulatedRGB, float3(1.0f, 0.4f, 0.0f), edgeWeight);
+    
+    if (hitLaserBeam && laserCamT < pathTracerDistance) {
+        float3 laserRGB = max(XYZToRGB(WavelengthToXYZ(laserWavelength)), 0.0f) * 80.0f;
+        finalRGB = lerp(finalRGB, laserRGB, 0.85f);
+    }
+
+    float3 tonemappedRGB = finalRGB / (finalRGB + float3(1.0f, 1.0f, 1.0f));
+    float3 gammaCorrected = pow(tonemappedRGB, 1.0f / 2.2f);
+    
+    float linearEyeDepth = LinearEyeDepth(_CameraDepthTexture.Load(int3(id.xy, 0)).r);
+    float unityObjectDistance = linearEyeDepth / max(0.00001f, baseViewDir.z);
+    if (unityObjectDistance < 999.0f && unityObjectDistance < pathTracerDistance && unityObjectDistance < laserCamT) {
+        Result[id.xy] = float4(BackgroundSource.Load(int3(id.xy, 0)).rgb, 1.0f);
+    } else {
+        Result[id.xy] = float4(gammaCorrected, 1.0f);
+    }
+}

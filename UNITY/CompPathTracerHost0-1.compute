@@ -1,0 +1,97 @@
+#pragma kernel CSMain
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    float3 albedo;
+};
+
+RWTexture2D<float4> Result;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, float3 albedo) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    
+    if (discriminant < 0.0f) return;
+    
+    float t = -b - sqrt(discriminant);
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.albedo = albedo;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    // 1. Generate Camera Ray (No jittering/AA needed for base verification)
+    float2 uv = float2((id.xy) / float2(width, height) * 2.0f - 1.0f);
+    float4 clipPos = float4(uv.x, uv.y, 0.0f, 1.0f);
+    float4 viewDir = mul(_CameraInverseProjection, clipPos);
+    viewDir /= viewDir.w;
+    float4 worldDir = mul(_CameraToWorld, float4(viewDir.xyz, 0.0f));
+    
+    Ray ray;
+    ray.origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    ray.direction = normalize(worldDir.xyz);
+
+    // 2. Trace Scene
+    HitRecord hit;
+    hit.didIntersect = false;
+    hit.t = 1e20f;
+    hit.position = float3(0,0,0);
+    hit.normal = float3(0,0,0);
+    hit.albedo = float3(0,0,0);
+
+    // Render a single sphere in the center
+    IntersectSphere(ray, hit, float3(0.0f, 0.0f, 5.0f), 1.5f, float3(0.0f, 0.8f, 0.8f));
+
+    // 3. Shading Context
+    float3 finalColor = float3(0.05f, 0.05f, 0.05f); // Dark background sky
+
+    if (hit.didIntersect) {
+        // Define an explicit point light source in world space
+        float3 lightPos = float3(5.0f, 5.0f, 2.0f);
+        float3 lightColor = float3(1.0f, 1.0f, 1.0f);
+        
+        // Derive Phong vectors
+        float3 L = normalize(lightPos - hit.position);
+        float3 N = hit.normal;
+        float3 V = normalize(ray.origin - hit.position);
+        float3 R = reflect(-L, N);
+
+        // A. Ambient Component
+        float3 ambient = 0.1f * hit.albedo;
+
+        // B. Diffuse Component (Lambertian)
+        float3 diffuse = hit.albedo * max(dot(L, N), 0.0f);
+
+        // C. Specular Component (Shiny Highlight)
+        float shininess = 32.0f;
+        float3 specular = lightColor * pow(max(dot(R, V), 0.0f), shininess);
+
+        // Combine components
+        finalColor = ambient + diffuse + specular;
+    }
+
+    // Output directly to screen
+    Result[id.xy] = float4(finalColor, 1.0f);
+}

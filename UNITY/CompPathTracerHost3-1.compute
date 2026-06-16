@@ -1,0 +1,95 @@
+#pragma kernel CSMain
+
+// --- Data Structures ---
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    float3 albedo;
+};
+
+// --- Buffers & Inbound Textures ---
+Texture2D<float4> BackgroundSource;      
+Texture2D<float> _CameraDepthTexture;    
+RWTexture2D<float4> Result;              
+
+// Sampler for normalized texture sampling
+SamplerState sampler_linear_clamp;
+
+// --- Uniforms & Global Matrices ---
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float4 _ZBufferParams;
+
+// --- Geometry Intersection Formulas ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, float3 albedo) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    
+    if (discriminant < 0.0f) return;
+    
+    float t = -b - sqrt(discriminant);
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.albedo = albedo;
+    }
+}
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    // 1. Calculate Normalized UVs (0 to 1) for screen-independent sampling
+    float2 uvScreen = float2(id.xy) / float2(width, height);
+    
+    // 2. Sample textures using normalized coordinates to fix the offset/sliding issue
+    float3 unityColor = BackgroundSource.SampleLevel(sampler_linear_clamp, uvScreen, 0).xyz;
+    float rawDepth = _CameraDepthTexture.SampleLevel(sampler_linear_clamp, uvScreen, 0);
+    
+    float unityObjectDistance = 1.0f / (_ZBufferParams.z * rawDepth + _ZBufferParams.w);
+    
+    // 3. Compute Viewport Ray
+    // Map pixel to NDC (-1 to 1)
+    float2 uv = (float2(id.xy) + 0.5f) / float2(width, height) * 2.0f - 1.0f;
+    float4 clipPos = float4(uv.x, uv.y, 0.0f, 1.0f);
+    
+    float4 viewDir = mul(_CameraInverseProjection, clipPos);
+    viewDir /= viewDir.w;
+    
+    float4 worldDir = mul(_CameraToWorld, float4(viewDir.xyz, 0.0f));
+
+    Ray ray;
+    ray.origin = _CameraToWorld._m03_m13_m23;
+    ray.direction = normalize(worldDir.xyz);
+
+    // 4. Intersection
+    HitRecord hit;
+    hit.didIntersect = false;
+    hit.t = 1e20f;
+    IntersectSphere(ray, hit, float3(0.0f, 0.0f, 5.0f), 1.5f, float3(0.0f, 0.8f, 0.8f));
+
+    // 5. Compositing
+    float3 outputPixelColor = unityColor;
+    if (unityObjectDistance >= 999.0f) {
+        outputPixelColor = float3(0.0f, 0.0f, 0.0f);
+    }
+
+    if (hit.didIntersect && hit.t < unityObjectDistance) {
+        outputPixelColor = float3(1.0, 0.0, 0.0);
+    }
+
+    Result[id.xy] = float4(outputPixelColor, 1.0f);
+}

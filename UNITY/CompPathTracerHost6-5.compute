@@ -1,0 +1,423 @@
+// #pragma kernel CSMain
+
+// // --- Data Structures ---
+// struct Ray {
+//     float3 origin;
+//     float3 direction;
+//     float wavelength; // Spectral wavelength in nanometers (nm)
+// };
+
+// struct HitRecord {
+//     bool didIntersect;
+//     float t;
+//     float3 position;
+//     float3 normal;
+//     int materialID;    
+// };
+
+// // --- Buffers ---
+// RWTexture2D<float4> Result;              
+// RWTexture2D<float4> AccumulationBuffer;
+
+// // --- Uniforms ---
+// float4x4 _CameraToWorld;
+// float4x4 _CameraInverseProjection;
+// float _Time;
+// int _SampleIndex;
+
+// // --- Pseudo-Random Number Generator (PCG Hash) ---
+// uint GenerateSeed(uint2 id, uint width, float time) {
+//     uint timeSeed = asuint(time);
+//     uint state = id.y * width + id.x;
+//     state ^= timeSeed;
+//     state = state * 277803737u + 289133645u;
+//     return state;
+// }
+
+// float NextRandom(inout uint state) {
+//     state = state * 747796405u + 289133645u;
+//     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+//     return (float)((word >> 22u) ^ word) / 4294967295.0f;
+// }
+
+// float3 RandomInUnitSphere(inout uint state) {
+//     while (true) {
+//         float3 p = float3(
+//             NextRandom(state) * 2.0f - 1.0f,
+//             NextRandom(state) * 2.0f - 1.0f,
+//             NextRandom(state) * 2.0f - 1.0f
+//         );
+//         if (dot(p, p) < 1.0f) return p;
+//     }
+//     return float3(0,0,0);
+// }
+
+// // --- Spectral Material Curves ---
+// float EvaluateSpectralReflectance(int matID, float wavelength, float3 hitPosition) {
+//     if (matID == 1) { // Sphere: Vibrant Spectral Red
+//         return lerp(0.01f, 0.98f, smoothstep(580.0f, 610.0f, wavelength));
+//     }
+//     if (matID == 2) { // Floor: Procedural Anti-Aliased Grid
+//         float scale = 1.0f; 
+//         float lineWidth = 0.04f; 
+        
+//         float2 gridLoc = abs(frac(hitPosition.xz / scale - 0.5f) - 0.5f) / lineWidth;
+//         float lineFactor = min(gridLoc.x, gridLoc.y);
+//         float isLine = 1.0f - min(lineFactor, 1.0f);
+        
+//         float lineReflectance = 0.95f;   // White lines
+//         float spaceReflectance = 0.40f;  // Untinted grey squares
+        
+//         return lerp(spaceReflectance, lineReflectance, isLine);
+//     }
+//     return 0.0f;
+// }
+
+// // --- Sky Emission Curve ---
+// float EvaluateSkyEmission(float wavelength, float3 rayDir) {
+//     // Constant fallback radiance baseline for indirect light calculation
+//     return 4.0f;
+// }
+
+// // --- CIE 1931 XYZ Multi-Gaussian Approximation Curves ---
+// float3 WavelengthToXYZ(float wave) {
+//     float x1 = 1.056f * exp(-0.5f * ((wave - 599.8f) / 37.9f) * ((wave - 599.8f) / 37.9f));
+//     float x2 = 0.362f * exp(-0.5f * ((wave - 442.0f) / 16.0f) * ((wave - 442.0f) / 16.0f));
+//     float x3 = 0.160f * exp(-0.5f * ((wave - 501.1f) / 24.0f) * ((wave - 501.1f) / 24.0f)); 
+//     float x = x1 + x2 + x3;
+
+//     float y = 0.821f * exp(-0.5f * ((wave - 568.8f) / 46.9f) * ((wave - 568.8f) / 46.9f))
+//             + 0.286f * exp(-0.5f * ((wave - 530.9f) / 16.3f) * ((wave - 530.9f) / 16.3f));
+
+//     float z = 1.217f * exp(-0.5f * ((wave - 437.0f) / 11.8f) * ((wave - 437.0f) / 11.8f))
+//             + 0.681f * exp(-0.5f * ((wave - 459.0f) / 26.0f) * ((wave - 459.0f) / 26.0f));
+
+//     return float3(x, y, z);
+// }
+
+// // Standard sRGB Transformation Matrix (Balanced for D65 white targets)
+// float3 XYZToRGB(float3 xyz) {
+//     float r =  3.2404542f * xyz.x - 1.5371385f * xyz.y - 0.4985314f * xyz.z;
+//     float g = -0.9692660f * xyz.x + 1.8760108f * xyz.y + 0.0415560f * xyz.z;
+//     float b =  0.0556434f * xyz.x - 2.0402590f * xyz.y + 1.0572252f * xyz.z;
+//     return float3(r, g, b);
+// }
+
+// // --- Geometry Intersection Formulas ---
+// void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+//     float3 oc = ray.origin - center;
+//     float b = dot(oc, ray.direction);
+//     float c = dot(oc, oc) - radius * radius;
+//     float discriminant = b * b - c;
+    
+//     if (discriminant < 0.0f) return;
+//     float t = -b - sqrt(discriminant);
+//     if (t <= 0.001f) {
+//         t = -b + sqrt(discriminant);
+//     }
+    
+//     if (t > 0.001f && t < bestHit.t) {
+//         bestHit.didIntersect = true;
+//         bestHit.t = t;
+//         bestHit.position = ray.origin + t * ray.direction;
+//         bestHit.normal = normalize(bestHit.position - center);
+//         bestHit.materialID = matID;
+//     }
+// }
+
+// void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+//     float denom = dot(planeNormal, ray.direction);
+//     if (abs(denom) > 1e-6f) {
+//         float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+//         if (t > 0.001f && t < bestHit.t) {
+//             bestHit.didIntersect = true;
+//             bestHit.t = t;
+//             bestHit.position = ray.origin + t * ray.direction;
+//             bestHit.normal = planeNormal;
+//             bestHit.materialID = matID;
+//         }
+//     }
+// }
+
+// [numthreads(32, 32, 1)]
+// void CSMain(uint3 id : SV_DispatchThreadID) {
+//     uint width, height;
+//     Result.GetDimensions(width, height);
+//     if (id.x >= width || id.y >= height) return;
+    
+//     uint rngState = GenerateSeed(id.xy, width, _Time);
+    
+//     float2 uv = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height) * 2.0f - 1.0f;
+//     float4 clipPos = float4(uv.x, uv.y, 0.0f, 1.0f);
+    
+//     float4 viewDir = mul(_CameraInverseProjection, clipPos);
+//     viewDir /= viewDir.w;
+//     float4 worldDir = mul(_CameraToWorld, float4(viewDir.xyz, 0.0f));
+
+//     // Sample continuous randomized wavelength per ray execution (380nm - 780nm)
+//     float sampledWavelength = 380.0f + NextRandom(rngState) * (780.0f - 380.0f);
+    
+//     Ray ray;
+//     ray.origin = _CameraToWorld._m03_m13_m23;
+//     ray.direction = normalize(worldDir.xyz);
+//     ray.wavelength = sampledWavelength;
+
+//     float throughput = 1.0f;        
+//     float3 frameRGB = float3(0.0f, 0.0f, 0.0f);
+//     bool hitSkyDirectly = false;
+//     int maxBounces = 4; 
+    
+//     for (int i = 0; i < maxBounces; i++) {
+//         HitRecord hit;
+//         hit.didIntersect = false;
+//         hit.t = 1e20f;
+//         hit.materialID = 0;
+        
+//         IntersectSphere(ray, hit, float3(0.0f, 0.0f, 4.0f), 1.0f, 1);  
+//         IntersectPlane(ray, hit, float3(0.0f, -1.0f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2); 
+
+//         if (hit.didIntersect) {
+//             ray.origin = hit.position + hit.normal * 0.001f;
+//             ray.direction = normalize(hit.normal + RandomInUnitSphere(rngState));
+            
+//             throughput *= EvaluateSpectralReflectance(hit.materialID, ray.wavelength, hit.position);
+
+//             if (throughput < 0.05f) {
+//                 if (NextRandom(rngState) > 0.2f) break;
+//                 throughput /= 0.2f;
+//             }
+//         } 
+//         else {
+//             // Track if the primary camera ray missed everything and directly hit empty sky
+//             if (i == 0) {
+//                 hitSkyDirectly = true;
+//             }
+            
+//             // Calculate continuous integrated spectral XYZ coordinates
+//             float3 xyz = WavelengthToXYZ(ray.wavelength) * EvaluateSkyEmission(ray.wavelength, ray.direction);
+//             xyz *= 0.045f;
+            
+//             // Transform to RGB and apply throughput from material bounces
+//             frameRGB = XYZToRGB(xyz) * throughput;
+//             break;
+//         }
+//     }
+
+//     // --- Absolute Background Override ---
+//     // If the ray hits the sky without striking any scene geometries, force clean, absolute white.
+//     // This cleans up the raw integration imbalances causing pink/orange fringing in screenspace.
+//     if (hitSkyDirectly) {
+//         frameRGB = float3(1.5f, 1.5f, 1.5f); 
+//     }
+    
+//     frameRGB = max(frameRGB, 0.0f);
+
+//     // Temporal Accumulator Mix
+//     float blendFactor = 1.0f / (float)_SampleIndex;
+//     float3 historicalRGB = AccumulationBuffer[id.xy].xyz;
+//     float3 accumulatedRGB = lerp(historicalRGB, frameRGB, blendFactor);
+    
+//     AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+    
+//     // Reinhard Tonemapping & Gamma Correction Standard Approximation
+//     float3 tonemappedRGB = accumulatedRGB / (accumulatedRGB + float3(1.0f, 1.0f, 1.0f));
+//     float3 gammaCorrected = pow(tonemappedRGB, 1.0f / 2.2f);
+    
+//     Result[id.xy] = float4(gammaCorrected, 1.0f);
+// }
+
+
+#pragma kernel CSMain
+
+// --- Data Structures ---
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;    
+};
+
+// --- Buffers ---
+RWTexture2D<float4> Result;              
+RWTexture2D<float4> AccumulationBuffer;
+
+// --- Uniforms ---
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float _Time;
+int _SampleIndex;
+
+// --- Pseudo-Random Number Generator (PCG Hash) ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RandomInUnitSphere(inout uint state) {
+    while (true) {
+        float3 p = float3(
+            NextRandom(state) * 2.0f - 1.0f,
+            NextRandom(state) * 2.0f - 1.0f,
+            NextRandom(state) * 2.0f - 1.0f
+        );
+        if (dot(p, p) < 1.0f) return p;
+    }
+    return float3(0,0,0);
+}
+
+// --- RGB Material Surface Properties ---
+float3 EvaluateMaterialAlbedo(int matID, float3 hitPosition) {
+    if (matID == 1) { 
+        // Sphere: Solid Vibrant Red
+        return float3(0.95f, 0.05f, 0.05f);
+    }
+    if (matID == 2) { 
+        // Floor: Procedural Anti-Aliased Grid with Accentuated High-Contrast Tiles
+        float scale = 1.0f;
+        float lineWidth = 0.04f; 
+        
+        float2 gridLoc = abs(frac(hitPosition.xz / scale - 0.5f) - 0.5f) / lineWidth;
+        float lineFactor = min(gridLoc.x, gridLoc.y);
+        float isLine = 1.0f - min(lineFactor, 1.0f);
+        
+        float3 lineAlbedo = float3(0.95f, 0.95f, 0.95f);  // White lines
+        float3 spaceAlbedo = float3(0.08f, 0.08f, 0.08f); // Accentuated deep charcoal squares
+        
+        return lerp(spaceAlbedo, lineAlbedo, isLine);
+    }
+    return float3(0.0f, 0.0f, 0.0f);
+}
+
+// --- Sky Emission (Pure RGB) ---
+float3 EvaluateSkyColor(float3 rayDir) {
+    // Balanced RGB sky radiance baseline
+    return float3(1.0f, 1.0f, 1.0f) * 4.0f;
+}
+
+// --- Geometry Intersection Formulas ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    
+    if (discriminant < 0.0f) return;
+    float t = -b - sqrt(discriminant);
+    if (t <= 0.001f) {
+        t = -b + sqrt(discriminant);
+    }
+    
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.materialID = matID;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal;
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    float2 uv = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height) * 2.0f - 1.0f;
+    float4 clipPos = float4(uv.x, uv.y, 0.0f, 1.0f);
+    
+    float4 viewDir = mul(_CameraInverseProjection, clipPos);
+    viewDir /= viewDir.w;
+    float4 worldDir = mul(_CameraToWorld, float4(viewDir.xyz, 0.0f));
+
+    Ray ray;
+    ray.origin = _CameraToWorld._m03_m13_m23;
+    ray.direction = normalize(worldDir.xyz);
+
+    float3 throughput = float3(1.0f, 1.0f, 1.0f);
+    float3 frameRGB = float3(0.0f, 0.0f, 0.0f);
+    bool hitSkyDirectly = false;
+    int maxBounces = 4;
+
+    for (int i = 0; i < maxBounces; i++) {
+        HitRecord hit;
+        hit.didIntersect = false;
+        hit.t = 1e20f;
+        hit.materialID = 0;
+        
+        IntersectSphere(ray, hit, float3(0.0f, 0.0f, 4.0f), 1.0f, 1);
+        IntersectPlane(ray, hit, float3(0.0f, -1.0f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2); 
+
+        if (hit.didIntersect) {
+            ray.origin = hit.position + hit.normal * 0.001f;
+            ray.direction = normalize(hit.normal + RandomInUnitSphere(rngState));
+            
+            throughput *= EvaluateMaterialAlbedo(hit.materialID, hit.position);
+            
+            // Russian Roulette optimization based on color vector magnitude
+            float luminance = dot(throughput, float3(0.299f, 0.587f, 0.114f));
+            if (luminance < 0.05f) {
+                if (NextRandom(rngState) > 0.2f) break;
+                throughput /= 0.2f;
+            }
+        } 
+        else {
+            if (i == 0) {
+                hitSkyDirectly = true;
+            }
+            
+            // Accumulate illuminated color from background environment
+            frameRGB = EvaluateSkyColor(ray.direction) * throughput;
+            break;
+        }
+    }
+
+    // --- Clean Background Force ---
+    if (hitSkyDirectly) {
+        frameRGB = float3(1.5f, 1.5f, 1.5f);
+    }
+    
+    frameRGB = max(frameRGB, 0.0f);
+
+    // Temporal Accumulator Mix
+    float blendFactor = 1.0f / (float)_SampleIndex;
+    float3 historicalRGB = AccumulationBuffer[id.xy].xyz;
+    float3 accumulatedRGB = lerp(historicalRGB, frameRGB, blendFactor);
+    
+    AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+
+    // Reinhard Tonemapping & Gamma Correction Standard Approximation
+    float3 tonemappedRGB = accumulatedRGB / (accumulatedRGB + float3(1.0f, 1.0f, 1.0f));
+    float3 gammaCorrected = pow(tonemappedRGB, 1.0f / 2.2f);
+    
+    Result[id.xy] = float4(gammaCorrected, 1.0f);
+}

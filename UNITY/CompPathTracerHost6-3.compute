@@ -1,0 +1,216 @@
+#pragma kernel CSMain
+
+// --- Data Structures ---
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float wavelength; // Spectral wavelength in nanometers (nm)
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;    
+};
+
+// --- Buffers ---
+RWTexture2D<float4> Result;              
+RWTexture2D<float4> AccumulationBuffer;
+
+// --- Uniforms ---
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float _Time;
+int _SampleIndex;
+
+// --- Pseudo-Random Number Generator (PCG Hash) ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RandomInUnitSphere(inout uint state) {
+    while (true) {
+        float3 p = float3(
+            NextRandom(state) * 2.0f - 1.0f,
+            NextRandom(state) * 2.0f - 1.0f,
+            NextRandom(state) * 2.0f - 1.0f
+        );
+        if (dot(p, p) < 1.0f) return p;
+    }
+    return float3(0,0,0);
+}
+
+// --- Spectral Material Curves ---
+float EvaluateSpectralReflectance(int matID, float wavelength, float3 hitPosition) {
+    if (matID == 1) { // Sphere: White/Grey matte base
+        return 0.7f;
+    }
+    if (matID == 2) { // Floor: Checkerboard Pattern
+        float scale = 2.0f;
+        float2 check = floor(hitPosition.xz / scale);
+        float pattern = countbits(uint(check.x + check.y)) & 1;
+        
+        // Let's give it a slight spectral twist: alternate between a yellow tint and a cyan tint
+        if (pattern > 0.5f) {
+            // Yellow tint (reflects higher wavelengths/red-green spectrum)
+            return lerp(0.1f, 0.8f, smoothstep(500.0f, 650.0f, wavelength));
+        } else {
+            // Cyan tint (reflects lower wavelengths/blue-green spectrum)
+            return lerp(0.8f, 0.1f, smoothstep(450.0f, 600.0f, wavelength));
+        }
+    }
+    return 0.0f;
+}
+
+// --- Sky Emission Curve ---
+float EvaluateSkyEmission(float wavelength, float3 rayDir) {
+    float t = 0.5f * (rayDir.y + 1.0f);
+    // Physically modeled simple blue/white sky distribution
+    float blueSkySpectrum = 0.2f + 1.2f * exp(-0.5f * ((wavelength - 450.0f) / 40.0f) * ((wavelength - 450.0f) / 40.0f));
+    float whiteHorizonSpectrum = 0.8f;
+    return lerp(whiteHorizonSpectrum, blueSkySpectrum, t) * 2.0f;
+}
+
+// --- Human Eye Response Profiles (CIE 1931 XYZ Color Matching Curves) ---
+float3 WavelengthToXYZ(float wave) {
+    float x = 1.056f * exp(-0.5f * ((wave - 599.8f) / 37.9f) * ((wave - 599.8f) / 37.9f))
+            + 0.362f * exp(-0.5f * ((wave - 442.0f) / 16.0f) * ((wave - 442.0f) / 16.0f))
+            - 0.065f * exp(-0.5f * ((wave - 501.1f) / 11.6f) * ((wave - 501.1f) / 11.6f));
+    float y = 0.821f * exp(-0.5f * ((wave - 568.8f) / 46.9f) * ((wave - 568.8f) / 46.9f))
+            + 0.286f * exp(-0.5f * ((wave - 530.9f) / 16.3f) * ((wave - 530.9f) / 16.3f));
+    float z = 1.217f * exp(-0.5f * ((wave - 437.0f) / 11.8f) * ((wave - 437.0f) / 11.8f))
+            + 0.681f * exp(-0.5f * ((wave - 459.0f) / 26.0f) * ((wave - 459.0f) / 26.0f));
+    return clamp(float3(x, y, z), 0.0f, 10.0f);
+}
+
+float3 XYZToRGB(float3 xyz) {
+    float r =  3.2404542f * xyz.x - 1.5371385f * xyz.y - 0.4985314f * xyz.z;
+    float g = -0.9692660f * xyz.x + 1.8760108f * xyz.y + 0.0415560f * xyz.z;
+    float b =  0.0556434f * xyz.x - 2.0402590f * xyz.y + 1.0572252f * xyz.z;
+    return float3(r, g, b);
+}
+
+// --- Geometry Intersection Formulas ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    
+    if (discriminant < 0.0f) return;
+    float t = -b - sqrt(discriminant);
+    if (t <= 0.001f) {
+        t = -b + sqrt(discriminant);
+    }
+    
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.materialID = matID;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal;
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    
+    // Anti-aliasing pixel screen coordinates jitter
+    float2 uv = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height) * 2.0f - 1.0f;
+    float4 clipPos = float4(uv.x, uv.y, 0.0f, 1.0f);
+    
+    float4 viewDir = mul(_CameraInverseProjection, clipPos);
+    viewDir /= viewDir.w;
+    float4 worldDir = mul(_CameraToWorld, float4(viewDir.xyz, 0.0f));
+
+    // Initialize random spectral wavelength for this sample (Visible human spectrum: 380nm to 780nm)
+    float sampledWavelength = 380.0f + NextRandom(rngState) * (780.0f - 380.0f);
+    
+    Ray ray;
+    ray.origin = _CameraToWorld._m03_m13_m23;
+    ray.direction = normalize(worldDir.xyz);
+    ray.wavelength = sampledWavelength;
+
+    float throughput = 1.0f;        
+    float finalIntensity = 0.0f;
+    int maxBounces = 4; 
+    
+    for (int i = 0; i < maxBounces; i++) {
+        HitRecord hit;
+        hit.didIntersect = false;
+        hit.t = 1e20f;
+        hit.materialID = 0;
+        
+        // Trace Ray against basic primitives
+        IntersectSphere(ray, hit, float3(0.0f, 0.0f, 4.0f), 1.0f, 1);  // Matter Sphere
+        IntersectPlane(ray, hit, float3(0.0f, -1.0f, 0.0f), float3(0.0f, 1.0f, 0.0f), 2); // Floor Plane
+
+        if (hit.didIntersect) {
+            // Surface Bounce: Pure Diffuse Lambertian Reflection
+            ray.origin = hit.position + hit.normal * 0.001f;
+            ray.direction = normalize(hit.normal + RandomInUnitSphere(rngState));
+            
+            // Multiply throughput by the single wavelength's reflectance evaluated at this material
+            throughput *= EvaluateSpectralReflectance(hit.materialID, ray.wavelength, hit.position);
+
+            // Russian Roulette to elegantly terminate paths with low energy contribution
+            if (throughput < 0.05f) {
+                if (NextRandom(rngState) > 0.2f) break;
+                throughput /= 0.2f;
+            }
+        } 
+        else {
+            // Hit Sky: Accumulate sky emission light source 
+            finalIntensity += throughput * EvaluateSkyEmission(ray.wavelength, ray.direction);
+            break;
+        }
+    }
+
+    // --- Spectral Reconstitution Block ---
+    // Convert the isolated wavelength intensity back into CIE XYZ space, then map to RGB
+    float3 xyzCoordinates = WavelengthToXYZ(ray.wavelength) * finalIntensity;
+    float exposureControl = 1.0f;
+    float3 frameRGB = XYZToRGB(xyzCoordinates) * exposureControl;
+
+    // Temporal Accumulation Engine
+    float blendFactor = 1.0f / (float)_SampleIndex;
+    float3 historicalRGB = AccumulationBuffer[id.xy].xyz;
+    float3 accumulatedRGB = lerp(historicalRGB, frameRGB, blendFactor);
+    
+    AccumulationBuffer[id.xy] = float4(accumulatedRGB, 1.0f);
+    
+    // Clean Reinhardt Reinhard Tonemapping
+    float3 tonemappedRGB = accumulatedRGB / (accumulatedRGB + float3(1.0f, 1.0f, 1.0f));
+    Result[id.xy] = float4(tonemappedRGB, 1.0f);
+}

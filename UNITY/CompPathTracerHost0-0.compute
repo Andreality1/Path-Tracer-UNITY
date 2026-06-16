@@ -1,0 +1,167 @@
+#pragma kernel CSMain
+
+// --- Data Structures ---
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    float3 albedo;
+    float3 emission;
+};
+
+// --- Buffers and Uniforms ---
+RWTexture2D<float4> Result;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+uint _FrameSeed;
+
+// --- Random Number Generation (PCG Hash) ---
+uint NextRandom(inout uint seed) {
+    seed = seed * 747796405u + 289133645u;
+    uint word = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float RandomFloat(inout uint seed) {
+    return (NextRandom(seed) & 0xFFFFFFu) / 16777216.0f;
+}
+
+// Cosine-weighted hemisphere sampling for diffuse surfaces
+float3 SampleHemisphereCosine(float3 normal, inout uint seed) {
+    float u1 = RandomFloat(seed);
+    float u2 = RandomFloat(seed);
+    
+    float phi = 2.0f * 3.14159265f * u1;
+    float theta = acos(sqrt(u2));
+    
+    float3 localRay;
+    localRay.x = cos(phi) * sin(theta);
+    localRay.y = sin(phi) * sin(theta);
+    localRay.z = cos(theta);
+    
+    // Create an orthonormal basis relative to the normal
+    float3 up = abs(normal.z) < 0.999f ? float3(0, 0, 1) : float3(1, 0, 0);
+    float3 tangent = normalize(cross(up, normal));
+    float3 bitangent = cross(normal, tangent);
+    
+    return tangent * localRay.x + bitangent * localRay.y + normal * localRay.z;
+}
+
+// --- Analytical Intersections ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, float3 albedo, float3 emission) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    
+    if (discriminant < 0.0f) return;
+    
+    float t = -b - sqrt(discriminant);
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.albedo = albedo;
+        bestHit.emission = emission;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 normal, float distance, float3 albedo, float3 emission) {
+    float denom = dot(normal, ray.direction);
+    if (abs(denom) > 0.001f) {
+        float t = (distance - dot(normal, ray.origin)) / denom;
+        if (t > 0.001f && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = normal;
+            bestHit.albedo = albedo;
+            bestHit.emission = emission;
+        }
+    }
+}
+
+// --- Scene Setup ---
+HitRecord TraceScene(Ray ray) {
+    HitRecord bestHit;
+    bestHit.didIntersect = false;
+    bestHit.t = 1e20f; // Initialize to infinity
+    bestHit.position = float3(0,0,0);
+    bestHit.normal = float3(0,0,0);
+    bestHit.albedo = float3(0,0,0);
+    bestHit.emission = float3(0,0,0);
+
+    // Analytical primitives
+    IntersectPlane(ray, bestHit, float3(0, 1, 0), 0.0f, float3(0.2f, 0.2f, 0.2f), float3(0,0,0)); // Floor
+    IntersectSphere(ray, bestHit, float3(0, 3.0f, 10.0f), 3.0f, float3(0.0f, 0.8f, 0.8f), float3(0,0,0)); // Cyan Sphere
+    IntersectSphere(ray, bestHit, float3(0, 10.0f, 10.0f), 2.0f, float3(1.0f, 1.0f, 1.0f), float3(8.0f, 6.0f, 4.0f)); // Overheard Warm Light Source
+
+    return bestHit;
+}
+
+// --- Main Pipeline ---
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    // Initialize a per-pixel random seed using pixel position and frame counter
+    uint seed = id.x + id.y * width + _FrameSeed * 147483647u;
+
+    // 1. Generate Camera Ray
+    // Jitter pixel coordinates slightly within sub-pixel space for Anti-Aliasing
+    float2 subPixelJitter = float2(RandomFloat(seed), RandomFloat(seed)) - 0.5f;
+    float2 uv = float2((id.xy + subPixelJitter) / float2(width, height) * 2.0f - 1.0f);
+    
+    float4 clipPos = float4(uv.x, uv.y, 0.0f, 1.0f);
+    float4 viewDir = mul(_CameraInverseProjection, clipPos);
+    viewDir /= viewDir.w;
+    float4 worldDir = mul(_CameraToWorld, float4(viewDir.xyz, 0.0f));
+    
+    Ray ray;
+    ray.origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    ray.direction = normalize(worldDir.xyz);
+
+    // 2. Path Tracing Bouncing Loop
+    float3 accumulatedColor = float3(0, 0, 0);
+    float3 throughput = float3(1, 1, 1);
+    const int maxBounces = 4;
+
+    for (int bounce = 0; bounce < maxBounces; bounce++) {
+        HitRecord hit = TraceScene(ray);
+        
+        if (!hit.didIntersect) {
+            // Environment Skybox (Pure dark background)
+            accumulatedColor += throughput * float3(0.0f, 0.0f, 0.0f);
+            break;
+        }
+
+        // Add emitted radiance from light sources
+        accumulatedColor += throughput * hit.emission;
+
+        // Compute the next ray position and direction
+        ray.origin = hit.position + hit.normal * 0.001f; // Offset along normal to avoid self-shadowing acne
+        ray.direction = SampleHemisphereCosine(hit.normal, seed);
+
+        // Standard Lambertian BRDF evaluation
+        throughput *= hit.albedo;
+
+        // Early exit optimization if path energy drops too low
+        if (dot(throughput, throughput) < 0.0001f) break;
+    }
+
+    // Accumulate smoothly with historical frames
+    float4 historicalColor = Result[id.xy];
+    // Simple moving average over time frames
+    float blendFactor = 1.0f / (_FrameSeed + 1.0f);
+    Result[id.xy] = float4(lerp(historicalColor.xyz, accumulatedColor, blendFactor), 1.0f);
+}

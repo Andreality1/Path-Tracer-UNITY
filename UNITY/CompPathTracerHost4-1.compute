@@ -1,0 +1,184 @@
+#pragma kernel CSMain
+
+// --- Data Structures ---
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    float3 albedo;
+};
+
+// --- Buffers & Inbound Textures ---
+Texture2D<float4> BackgroundSource;      
+Texture2D<float> _CameraDepthTexture;    
+RWTexture2D<float4> Result;              
+
+SamplerState sampler_linear_clamp;
+
+// --- Uniforms & Global Matrices ---
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float4 _ZBufferParams;
+float _Time; 
+
+// --- Pseudo-Random Number Generator (PCG Hash) ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RandomInUnitSphere(inout uint state) {
+    while (true) {
+        float3 p = float3(
+            NextRandom(state) * 2.0f - 1.0f,
+            NextRandom(state) * 2.0f - 1.0f,
+            NextRandom(state) * 2.0f - 1.0f
+        );
+        if (dot(p, p) < 1.0f) return p;
+    }
+    return float3(0,0,0);
+}
+
+// --- Geometry Intersection Formulas ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, float3 albedo) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    
+    if (discriminant < 0.0f) return;
+    
+    float t = -b - sqrt(discriminant);
+    if (t > 0.001f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.albedo = albedo;
+    }
+}
+
+// --- NEW: Infinite Plane Intersection ---
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal) {
+    // Calculate the denominator to check if the ray is parallel to the plane
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        // Check if the intersection is in front of the camera and closer than previous hits
+        if (t > 0.001f && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal;
+            
+            // Procedural Grid Texture on the floor
+            // Uses standard floor/modulo math to draw line intervals
+            float scale = 1.0f; // Size of the grid cells
+            float lineWidth = 0.05f; // Thickness of the grid lines
+            
+            float2 gridLoc = abs(frac(bestHit.position.xz / scale - 0.5f) - 0.5f) / lineWidth;
+            float lineFactor = min(gridLoc.x, gridLoc.y);
+            float isLine = 1.0f - min(lineFactor, 1.0f);
+            
+            // Interpolate between floor base color (dark gray) and line color (light gray)
+            bestHit.albedo = lerp(float3(0.15f, 0.15f, 0.15f), float3(0.6f, 0.6f, 0.6f), isLine);
+        }
+    }
+}
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    
+    // 1. Calculate Normalized UVs
+    float2 uvScreen = float2(id.xy) / float2(width, height);
+    
+    // 2. Sample Unity background elements
+    float3 unityColor = BackgroundSource.SampleLevel(sampler_linear_clamp, uvScreen, 0).xyz;
+    float rawDepth = _CameraDepthTexture.SampleLevel(sampler_linear_clamp, uvScreen, 0);
+    float unityObjectDistance = 1.0f / (_ZBufferParams.z * rawDepth + _ZBufferParams.w);
+    
+    if (unityObjectDistance >= 999.0f) {
+        unityColor = float3(0.0f, 0.0f, 0.0f);
+    }
+    
+    // 3. Compute Viewport Ray
+    float2 uv = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height) * 2.0f - 1.0f;
+    float4 clipPos = float4(uv.x, uv.y, 0.0f, 1.0f);
+    
+    float4 viewDir = mul(_CameraInverseProjection, clipPos);
+    viewDir /= viewDir.w;
+    float4 worldDir = mul(_CameraToWorld, float4(viewDir.xyz, 0.0f));
+
+    Ray ray;
+    ray.origin = _CameraToWorld._m03_m13_m23;
+    ray.direction = normalize(worldDir.xyz);
+
+    // --- Path Tracing Loop ---
+    float3 throughput = float3(1.0f, 1.0f, 1.0f);
+    float3 accumulatedColor = float3(0.0f, 0.0f, 0.0f);
+    int maxBounces = 4; 
+    
+    float initialHitT = 1e20f;
+    bool checkedZBuffer = false;
+
+    for (int i = 0; i < maxBounces; i++) {
+        HitRecord hit;
+        hit.didIntersect = false;
+        hit.t = 1e20f;
+        
+        // Trace against the sphere
+        IntersectSphere(ray, hit, float3(0.0f, 0.0f, 5.0f), 1.5f, float3(0.8f, 0.1f, 0.1f)); 
+        
+        // --- NEW: Trace against the floor grid plane ---
+        // Positioned at Y = -1.5 (directly touching the bottom of our sphere of radius 1.5 centered at Y=0)
+        IntersectPlane(ray, hit, float3(0.0f, -1.5f, 0.0f), float3(0.0f, 1.0f, 0.0f));
+
+        if (hit.didIntersect) {
+            if (!checkedZBuffer) {
+                initialHitT = hit.t;
+                checkedZBuffer = true;
+                if (initialHitT > unityObjectDistance) {
+                    accumulatedColor += throughput * unityColor;
+                    break;
+                }
+            }
+
+            ray.origin = hit.position + hit.normal * 0.001f; 
+            ray.direction = normalize(hit.normal + RandomInUnitSphere(rngState));
+            throughput *= hit.albedo; 
+        } 
+        else {
+            if (!checkedZBuffer && unityObjectDistance < 999.0f) {
+                accumulatedColor += throughput * unityColor;
+            } else {
+                float3 skyColor = float3(0.5f, 0.7f, 1.0f); 
+                float t = 0.5f * (ray.direction.y + 1.0f);
+                skyColor = (1.0f - t) * float3(1.0f, 1.0f, 1.0f) + t * skyColor;
+                accumulatedColor += throughput * skyColor;
+            }
+            break; 
+        }
+    }
+
+    Result[id.xy] = float4(accumulatedColor, 1.0f);
+}
